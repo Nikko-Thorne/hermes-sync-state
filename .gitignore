@@ -1,0 +1,9 @@
+# This repo is the sync TOOL only — user state stays in their private repo
+skills/
+memories/
+cron/
+.env
+
+# Cloudflare wrangler cache (contains account info)
+.wrangler/
+__pycache__/

@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""hermes-sync -- cross-machine state sync for Hermes Agent.
+Run without args for interactive menu."""
+
+import os, sys, json, tarfile, io, hashlib, secrets, argparse, subprocess
+from pathlib import Path
+
+ESC = "\033"
+
+REQUIRED_DEPS = {
+    "bip39": "bip39",
+    "cryptography": "cryptography", 
+    "requests": "requests",
+}
+
+def _check_deps():
+    """Auto-install missing dependencies."""
+    missing = []
+    for mod, pkg in REQUIRED_DEPS.items():
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(pkg)
+    
+    if not missing:
+        return True
+    
+    print(f"\n  {ESC}[1;33mMissing dependencies: {', '.join(missing)}{ESC}[0m")
+    choice = input("  Install now? [Y/n]: ").strip().lower()
+    if choice and choice != 'y':
+        print("  Skipping. Some features may not work.")
+        return False
+    
+    print(f"  Installing {', '.join(missing)}...")
+    import subprocess, sys
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet"] + missing)
+    print(f"  {ESC}[1;32mDependencies installed.{ESC}[0m")
+    return True
+
+HERMES_HOME = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+CONFIG_PATH = HERMES_HOME / ".sync-config.json"
+SEED_PATH = HERMES_HOME / ".sync-seed"
+
+def _derive_key(seed_phrase):
+    from hashlib import pbkdf2_hmac
+    return pbkdf2_hmac("sha256", seed_phrase.encode(), b"hermes-sync-v1", 600_000, dklen=32)
+
+def encrypt_state(seed, tar_bytes):
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    key = _derive_key(seed)
+    nonce = secrets.token_bytes(12)
+    ct = AESGCM(key).encrypt(nonce, tar_bytes, b"")
+    return nonce + ct
+
+def decrypt_state(seed, blob):
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    key = _derive_key(seed)
+    nonce, ct = blob[:12], blob[12:]
+    return AESGCM(key).decrypt(nonce, ct, b"")
+
+def pack_state():
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name in ("skills", "memories", "cron"):
+            path = HERMES_HOME / name
+            if path.exists():
+                tar.add(path, arcname=name)
+    return buf.getvalue()
+
+def unpack_state(tar_bytes):
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
+        # filter="data" requires Python 3.12+; safe extraction for 3.11
+        import sys
+        if sys.version_info >= (3, 12):
+            tar.extractall(path=HERMES_HOME, filter="data")
+        else:
+            tar.extractall(path=HERMES_HOME)
+
+class BraveAdapter:
+    RELAY = os.environ.get("HERMES_SYNC_RELAY", "")
+
+    @staticmethod
+    def push(cfg):
+        seed = cfg.get("seed", "")
+        if not seed:
+            print("  No seed configured. Run setup first.")
+            return
+        if not BraveAdapter.RELAY:
+            print("  Set HERMES_SYNC_RELAY env var to your worker URL.")
+            print("  e.g. export HERMES_SYNC_RELAY=https://your-relay.workers.dev")
+            return
+        blob = encrypt_state(seed, pack_state())
+        import requests
+        h = hashlib.sha256(seed.encode()).hexdigest()[:16]
+        r = requests.put(f"{BraveAdapter.RELAY}/{h}", data=blob, timeout=30)
+        r.raise_for_status()
+        print(f"  Pushed encrypted blob ({len(blob)} bytes)")
+
+    @staticmethod
+    def pull(cfg):
+        seed = cfg.get("seed", "")
+        if not seed:
+            print("  No seed configured. Run setup first.")
+            return
+        import requests
+        h = hashlib.sha256(seed.encode()).hexdigest()[:16]
+        r = requests.get(f"{BraveAdapter.RELAY}/{h}", timeout=30)
+        if r.status_code == 404:
+            print("  No state found on relay. Push first from another machine.")
+            return
+        r.raise_for_status()
+        unpack_state(decrypt_state(seed, r.content))
+        print("  Pulled and decrypted state")
+
+class GitAdapter:
+    @staticmethod
+    def push(cfg):
+        subprocess.run(["git", "-C", str(HERMES_HOME), "add", "skills", "memories", "cron"], check=False)
+        subprocess.run(["git", "-C", str(HERMES_HOME), "commit", "-m", "sync: auto push"], check=False)
+        subprocess.run(["git", "-C", str(HERMES_HOME), "push", cfg["remote"]], check=True)
+        print("  Pushed to git remote")
+
+    @staticmethod
+    def pull(cfg):
+        subprocess.run(["git", "-C", str(HERMES_HOME), "pull", cfg["remote"], "--rebase"], check=True)
+        print("  Pulled from git remote")
+
+class LocalAdapter:
+    @staticmethod
+    def push(cfg):
+        import shutil
+        dst = Path(cfg["path"])
+        for name in ("skills", "memories", "cron"):
+            src = HERMES_HOME / name
+            if src.exists():
+                if (dst / name).exists():
+                    shutil.rmtree(dst / name)
+                shutil.copytree(src, dst / name)
+        print(f"  Copied to {dst}")
+
+    @staticmethod
+    def pull(cfg):
+        import shutil
+        src = Path(cfg["path"])
+        for name in ("skills", "memories", "cron"):
+            sp = src / name
+            if sp.exists():
+                if (HERMES_HOME / name).exists():
+                    shutil.rmtree(HERMES_HOME / name)
+                shutil.copytree(sp, HERMES_HOME / name)
+        print(f"  Pulled from {src}")
+
+class S3Adapter:
+    @staticmethod
+    def push(cfg):
+        blob = encrypt_state(cfg.get("seed",""), pack_state())
+        import urllib.request
+        req = urllib.request.Request(cfg["url"] + "/hermes-state", data=blob, method="PUT")
+        req.add_header("Authorization", f"Bearer {cfg['token']}")
+        urllib.request.urlopen(req, timeout=30)
+        print("  Pushed to S3")
+
+    @staticmethod
+    def pull(cfg):
+        import urllib.request
+        req = urllib.request.Request(cfg["url"] + "/hermes-state")
+        req.add_header("Authorization", f"Bearer {cfg['token']}")
+        resp = urllib.request.urlopen(req, timeout=30)
+        unpack_state(decrypt_state(cfg.get("seed",""), resp.read()))
+        print("  Pulled from S3")
+
+ADAPTERS = {
+    "brave":  (BraveAdapter,  "Brave Sync (seed phrase)",  "Encrypted cloud sync. Zero setup - just save 24 words."),
+    "git":    (GitAdapter,    "Private Git Repo",          "Your own private repo on GitHub/GitLab/Gitea."),
+    "local":  (LocalAdapter,  "Local Synced Folder",       "Syncthing, Dropbox, Nextcloud - any synced folder."),
+    "s3":     (S3Adapter,     "S3 / Cloudflare R2 Bucket", "Your own cloud storage bucket with API key."),
+}
+
+def tui_select():
+    options = list(ADAPTERS.items())
+    idx = 0
+
+    def draw():
+        sys.stdout.write(f"{ESC}[2J{ESC}[H")
+        print(f"{ESC}[1;36m  Hermes Sync Setup{ESC}[0m\n")
+        print("  Choose how to sync your Hermes state across machines:\n")
+        for i, (key, (_, label, desc)) in enumerate(options):
+            prefix = f"{ESC}[1;32m>{ESC}[0m" if i == idx else "  "
+            hl = f"{ESC}[1;37m" if i == idx else ""
+            print(f"  {prefix} {hl}{label}{ESC}[0m")
+            print(f"     {ESC}[90m{desc}{ESC}[0m")
+            print()
+        print(f"  {ESC}[90mUP/DOWN navigate   ENTER select   Q quit{ESC}[0m")
+        sys.stdout.flush()
+
+    import termios, tty
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        draw()
+        while True:
+            ch = sys.stdin.read(1)
+            if ch == '\x1b':
+                ch2 = sys.stdin.read(2)
+                if ch2 == '[A': idx = (idx - 1) % len(options)
+                elif ch2 == '[B': idx = (idx + 1) % len(options)
+                draw()
+            elif ch in '\r\n':
+                return options[idx][0]
+            elif ch.lower() == 'q':
+                return ""
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        print()
+
+def setup_brave():
+    print(f"\n  {ESC}[1;36mBrave Sync Setup{ESC}[0m\n")
+    if SEED_PATH.exists():
+        print("  Seed phrase already exists.")
+        print(f"  {ESC}[93m{SEED_PATH.read_text().strip()}{ESC}[0m")
+        print("\n  Keep these 24 words safe.")
+        return {"seed": SEED_PATH.read_text().strip()}
+
+    import bip39, secrets
+    entropy = secrets.token_bytes(32)
+    seed = bip39.encode_bytes(entropy)
+    SEED_PATH.write_text(seed)
+
+    print("  Your sync seed phrase (save this somewhere safe):\n")
+    words = seed.split()
+    for i in range(0, 24, 6):
+        chunk = words[i:i+6]
+        line = "    " + "  ".join(w.ljust(18) for w in chunk)
+        print(f"    {ESC}[1;93m{line}{ESC}[0m")
+    print(f"\n  {ESC}[90mSaved to {SEED_PATH}{ESC}[0m")
+    print(f"  {ESC}[91mAnyone with these 24 words can sync your state. Guard them.{ESC}[0m")
+    input("\n  Press Enter to continue...")
+    return {"seed": seed}
+
+def setup_git():
+    print(f"\n  {ESC}[1;36mGit Sync Setup{ESC}[0m\n")
+    remote = input("  Git remote URL: ").strip()
+    if not remote: return {}
+    if not (HERMES_HOME / ".git").exists():
+        subprocess.run(["git", "-C", str(HERMES_HOME), "init"], check=True)
+        (HERMES_HOME / ".gitignore").write_text(".env\n*.lock\n")
+        subprocess.run(["git", "-C", str(HERMES_HOME), "add", ".gitignore"], check=False)
+        subprocess.run(["git", "-C", str(HERMES_HOME), "commit", "-m", "init"], check=False)
+    subprocess.run(["git", "-C", str(HERMES_HOME), "remote", "add", "origin", remote], check=False)
+    subprocess.run(["git", "-C", str(HERMES_HOME), "remote", "set-url", "origin", remote], check=False)
+    print(f"  Linked to {remote}")
+    return {"remote": remote}
+
+def setup_local():
+    print(f"\n  {ESC}[1;36mLocal Folder Sync Setup{ESC}[0m\n")
+    path = input("  Path to synced folder: ").strip()
+    if not path: return {}
+    path = str(Path(path).expanduser().resolve())
+    Path(path).mkdir(parents=True, exist_ok=True)
+    print(f"  Using {path}")
+    return {"path": path}
+
+def setup_s3():
+    print(f"\n  {ESC}[1;36mS3 / R2 Bucket Setup{ESC}[0m\n")
+    url = input("  Bucket URL: ").strip()
+    token = input("  API Token: ").strip()
+    if not url or not token: return {}
+    return {"url": url, "token": token}
+
+def main():
+    _check_deps()
+    parser = argparse.ArgumentParser(description="hermes-sync")
+    parser.add_argument("action", nargs="?", choices=["setup","push","pull"])
+    parser.add_argument("--adapter", choices=list(ADAPTERS.keys()))
+    args = parser.parse_args()
+
+    cfg = {}
+    if CONFIG_PATH.exists():
+        cfg = json.loads(CONFIG_PATH.read_text())
+
+    action = args.action
+    if not action:
+        print(f"{ESC}[1;36m  hermes-sync{ESC}[0m")
+        if cfg and cfg.get("adapter"):
+            print(f"  Configured: {ESC}[1;33m{cfg['adapter']}{ESC}[0m\n")
+            print("  1) Push state")
+            print("  2) Pull state")
+            print("  3) Change adapter")
+            print("  4) Exit")
+            choice = input("\n  Choice [1]: ").strip() or "1"
+            if choice == "1": action = "push"
+            elif choice == "2": action = "pull"
+            elif choice == "3": action = "setup"
+            else: return
+        else:
+            action = "setup"
+
+    if action == "setup":
+        key = tui_select()
+        if not key: return
+        adapter_cls, label, desc = ADAPTERS[key]
+        print(f"\n  Setting up: {ESC}[1;33m{label}{ESC}[0m")
+
+        if key == "brave": cfg.update(setup_brave())
+        elif key == "git": cfg.update(setup_git())
+        elif key == "local": cfg.update(setup_local())
+        elif key == "s3": cfg.update(setup_s3())
+
+        if cfg:
+            cfg["adapter"] = key
+            CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+            print(f"\n  {ESC}[1;32mSetup complete.{ESC}[0m Run 'hermes-sync push' to sync.")
+
+    elif action in ("push", "pull"):
+        adapter_key = args.adapter or cfg.get("adapter")
+        if not adapter_key:
+            print("No adapter configured. Run setup first.")
+            return
+        adapter_cls, _, _ = ADAPTERS[adapter_key]
+        print(f"  {ESC}[1;36m{action.upper()} via {adapter_key}{ESC}[0m")
+        try:
+            if action == "push": adapter_cls.push(cfg)
+            else: adapter_cls.pull(cfg)
+        except Exception as e:
+            print(f"  {ESC}[91mError: {e}{ESC}[0m")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,7 @@
+name = "hermes-sync-relay"
+main = "index.js"
+compatibility_date = "2025-01-01"
+
+[[r2_buckets]]
+binding = "SYNC_BLOB"
+bucket_name = "hermes-sync-blobs"
